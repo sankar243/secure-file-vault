@@ -1,0 +1,446 @@
+# Architecture & Implementation Plan - Secure File Vault
+
+## System Architecture & Security Overview
+
+The **Secure File Vault** is a zero-trust, security-first private cloud storage application. The system operates on a server-side **Envelope Encryption** architecture where plaintext file payload never touches permanent disk or object storage.
+
+### System Topology
+
+```
+                  ┌───────────────────────────────────────────┐
+                  │            Client Browser (React)          │
+                  └─────────────────────┬─────────────────────┘
+                                        │ HTTPS + Secure Cookie
+                                        ▼
+                  ┌───────────────────────────────────────────┐
+                  │       Reverse Proxy (Caddy / Nginx)       │
+                  │   TLS Termination, Security Headers, CSP   │
+                  └─────────────────────┬─────────────────────┘
+                                        │ HTTP Proxy (Internal Network)
+                                        ▼
+                  ┌───────────────────────────────────────────┐
+                  │          Fastify Node.js 24 Backend       │
+                  │ ┌───────────────────────────────────────┐ │
+                  │ │  Security Layer: CSRF, CORS, RateLimit │ │
+                  │ ├───────────────────────────────────────┤ │
+                  │ │ Auth, MFA (Argon2id, TOTP, Sessions)  │ │
+                  │ ├───────────────────────────────────────┤ │
+                  │ │ Validation, Quarantine & Magic Bytes │ │
+                  │ ├───────────────────────────────────────┤ │
+                  │ │ Envelope Crypto (libsodium XChaCha20) │ │
+                  │ └───────────────────┬───────────────────┘ │
+                  └──────────────┬──────┴─────────────┬────────┘
+                                 │                    │
+                  SQL Metadata   │                    │ Encrypted Ciphertext
+                                 ▼                    ▼
+                    ┌──────────────────┐    ┌──────────────────┐
+                    │ PostgreSQL 18.x  │    │  MinIO Object    │
+                    │  DB Metadata &   │    │  Storage Server  │
+                    │ Encrypted Keys   │    │ (Ciphertext Only)│
+                    └──────────────────┘    └──────────────────┘
+```
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Key Architecture Decisions for Approval:**
+> 1. **Server-Side Envelope Encryption (XChaCha20-Poly1305)**: Each file receives a unique 256-bit random Data Encryption Key (DEK). The DEK is encrypted using a master Key Encryption Key (KEK) stored securely via environment variables (ready for KMS integration) and saved in the `file_keys` table. MinIO receives only ciphertext `.enc` files.
+> 2. **Authentication & Password Hashing**: Uses `Argon2id` (memory 64MB, time 3 iterations, parallelism 4 threads) for user password hashing. Sessions are stored in PostgreSQL with cryptographically secure UUIDv4 tokens delivered in `HttpOnly`, `SameSite=Strict`, `Secure` cookies.
+> 3. **MFA**: TOTP-based authentication compatible with standard apps (Google Authenticator, Bitwarden, etc.) using `otplib` and QR code rendering. 10 single-use recovery codes are generated, Argon2id hashed, and stored in `recovery_codes`.
+> 4. **Malware Pipeline**: Uploads pass through a standard memory/disk quarantine buffer for magic-byte validation and filename sanitization, with a pluggable ClamAV scanner service interface.
+> 5. **Local Infrastructure**: Managed entirely via `docker-compose.yml` (PostgreSQL 18, MinIO, Backend, Reverse Proxy).
+
+---
+
+## Open Questions
+
+> [!NOTE]
+> None at this stage. All requirements align with production-grade OWASP ASVS 5.0 Level 2 standards.
+
+---
+
+## Technology Stack & Versions
+
+| Layer | Component / Library | Version / Specification | Role / Purpose |
+| :--- | :--- | :--- | :--- |
+| **Frontend** | React + TypeScript | 19.x / 5.x | User Interface |
+| **Build Tool** | Vite | 6.x | Lightning-fast dev server & frontend bundler |
+| **Icons & Styling** | Lucide React + Vanilla CSS | Modern CSS Tokens | High-aesthetic responsive dark-mode styling |
+| **Backend Runtime** | Node.js | 24 LTS | Server Runtime |
+| **Backend Framework**| Fastify | 5.x | High-performance, low-overhead REST/WS framework |
+| **Database** | PostgreSQL | 18.x | Database for Metadata & Session storage |
+| **ORM / Query** | Prisma / Drizzle | Latest Stable | Type-safe parameterized queries |
+| **Object Storage** | MinIO | Latest RELEASE | S3-compatible encrypted object store |
+| **Cryptography** | `libsodium-wrappers` / `argon2` | Latest | XChaCha20-Poly1305 & Argon2id |
+| **Auth & MFA** | `otplib` + `qrcode` | Latest | TOTP secret generation & QR rendering |
+| **Testing** | Vitest + Playwright | Latest | Unit, Integration, and E2E security tests |
+| **Reverse Proxy** | Caddy | Latest | TLS termination & HTTP security headers |
+
+---
+
+## Database Schema (PostgreSQL 18)
+
+```sql
+-- PostgreSQL 18 Database Schema for Secure File Vault
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- USERS TABLE
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    is_email_verified BOOLEAN DEFAULT FALSE,
+    mfa_enabled BOOLEAN DEFAULT FALSE,
+    mfa_secret_encrypted VARCHAR(512), -- Encrypted TOTP secret
+    storage_quota_bytes BIGINT DEFAULT 10737418240, -- 10 GB default quota
+    storage_used_bytes BIGINT DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- SESSIONS TABLE
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_token_hash VARCHAR(255) UNIQUE NOT NULL,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    last_active_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- RECOVERY CODES
+CREATE TABLE recovery_codes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash VARCHAR(255) NOT NULL,
+    is_used BOOLEAN DEFAULT FALSE,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- EMAIL VERIFICATION TOKENS
+CREATE TABLE email_verification_tokens (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- PASSWORD RESET TOKENS
+CREATE TABLE password_reset_tokens (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- FOLDERS TABLE
+CREATE TABLE folders (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    parent_id UUID REFERENCES folders(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    is_in_trash BOOLEAN DEFAULT FALSE,
+    deleted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_folder_per_parent UNIQUE(user_id, parent_id, name)
+);
+
+-- FILES TABLE
+CREATE TABLE files (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    folder_id UUID REFERENCES folders(id) ON DELETE SET NULL,
+    original_name VARCHAR(255) NOT NULL,
+    sanitized_name VARCHAR(255) NOT NULL,
+    mime_type VARCHAR(127) NOT NULL,
+    size_bytes BIGINT NOT NULL,
+    storage_path VARCHAR(512) UNIQUE NOT NULL, -- MinIO object UUID name
+    is_in_trash BOOLEAN DEFAULT FALSE,
+    deleted_at TIMESTAMPTZ,
+    scan_status VARCHAR(32) DEFAULT 'CLEAN', -- CLEAN, QUARANTINE, INFECTED
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- FILE ENCRYPTION KEYS (ENVELOPE CRYPTO)
+CREATE TABLE file_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    file_id UUID UNIQUE NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    encrypted_dek TEXT NOT NULL, -- Encrypted Data Encryption Key (wrapped by KEK)
+    dek_nonce VARCHAR(128) NOT NULL, -- Nonce used for DEK wrapping
+    file_nonce VARCHAR(128) NOT NULL, -- Nonce used for XChaCha20-Poly1305 file payload
+    algorithm VARCHAR(64) DEFAULT 'XChaCha20-Poly1305',
+    key_version INT DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- SHARES TABLE
+CREATE TABLE shares (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    file_id UUID REFERENCES files(id) ON DELETE CASCADE,
+    folder_id UUID REFERENCES folders(id) ON DELETE CASCADE,
+    share_token_hash VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255), -- Optional share password
+    max_downloads INT,
+    download_count INT DEFAULT 0,
+    expires_at TIMESTAMPTZ,
+    is_revoked BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT share_target_check CHECK (
+        (file_id IS NOT NULL AND folder_id IS NULL) OR
+        (file_id IS NULL AND folder_id IS NOT NULL)
+    )
+);
+
+-- AUDIT LOGS TABLE
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    event_type VARCHAR(64) NOT NULL,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    details JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- INDEXES FOR PERFORMANCE & AUTHORIZATION CHECK SPEED
+CREATE INDEX idx_sessions_token ON sessions(session_token_hash);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX idx_files_user_folder ON files(user_id, folder_id, is_in_trash);
+CREATE INDEX idx_folders_user_parent ON folders(user_id, parent_id, is_in_trash);
+CREATE INDEX idx_shares_token ON shares(share_token_hash);
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id, created_at DESC);
+CREATE INDEX idx_audit_logs_event ON audit_logs(event_type, created_at DESC);
+```
+
+---
+
+## API Specification
+
+### Authentication (`/api/v1/auth`)
+- `POST /register` -> Create account & send verification token
+- `POST /login` -> Validate credentials, check MFA requirement, initiate session
+- `POST /mfa/verify` -> Complete login with TOTP code
+- `POST /mfa/recovery` -> Complete login using a single-use recovery code
+- `POST /logout` -> Terminate current session & clear cookie
+- `POST /logout-all` -> Revoke all active sessions for current user
+- `POST /forgot-password` -> Request password reset email token
+- `POST /reset-password` -> Reset password with token
+- `GET /me` -> Get authenticated user profile & quota stats
+
+### MFA Management (`/api/v1/mfa`)
+- `POST /enable/init` -> Generate TOTP secret & QR code
+- `POST /enable/confirm` -> Verify TOTP code, enable MFA, return recovery codes
+- `POST /disable` -> Require password re-auth, then disable MFA
+
+### File & Folder Operations (`/api/v1/files`, `/api/v1/folders`)
+- `GET /folders` -> List folders in current parent
+- `POST /folders` -> Create folder
+- `PATCH /folders/:id` -> Rename / Move folder
+- `DELETE /folders/:id` -> Move folder to trash / Permanent delete
+- `GET /files` -> List files in folder / root
+- `POST /files/upload` -> Multipart upload file (Quarantine -> Scan -> Encrypt -> MinIO)
+- `GET /files/:id/download` -> Decrypt & stream file content
+- `GET /files/:id` -> Get file metadata & details
+- `PATCH /files/:id` -> Rename or move file
+- `DELETE /files/:id` -> Soft delete (Move to trash)
+- `POST /files/:id/restore` -> Restore file from trash
+- `DELETE /files/:id/permanent` -> Secure shred key & delete from MinIO
+
+### Sharing (`/api/v1/shares`)
+- `POST /shares` -> Create secure share link for file/folder
+- `GET /shares` -> List user's created share links
+- `DELETE /shares/:id` -> Revoke share link
+- `GET /public/share/:token` -> Fetch public share metadata
+- `POST /public/share/:token/download` -> Validate share password/limits & download file
+
+### Security & Audit (`/api/v1/security`)
+- `GET /sessions` -> List active user sessions
+- `DELETE /sessions/:id` -> Revoke specific session
+- `GET /audit-logs` -> List paginated security audit history
+- `POST /change-password` -> Re-authenticate & update password
+
+---
+
+## Threat Model (STRIDE) & ASVS Mapping
+
+| Threat Category (STRIDE) | Vulnerability / Risk | Mitigation Strategy | OWASP ASVS 5.0 Requirement |
+| :--- | :--- | :--- | :--- |
+| **Spoofing** | Credential stuffing, Session hijacking | Argon2id, TOTP MFA, Cryptographic session tokens, HttpOnly/SameSite Strict cookies | V2.1, V3.1, V3.2 |
+| **Tampering** | Parameter manipulation, File modification | Server-side authorization check (Strict User ID binding), XChaCha20-Poly1305 AEAD integrity check | V4.1, V5.1 |
+| **Repudiation** | Denied actions (file deletion, share) | Append-only security audit log (`audit_logs`) tracking IP, UA, timestamp & event type | V10.1, V10.2 |
+| **Information Disclosure** | IDOR/BOLA, MinIO leak, Key exposure | Random UUID IDs, Envelope encryption (MinIO contains ciphertext only), No keys in logs | V8.1, V9.1 |
+| **Denial of Service** | Upload payload explosion, Auth brute force | `@fastify/rate-limit`, strict body limit (100MB per file), DB Connection pooling | V13.1 |
+| **Elevation of Privilege** | Path traversal, Executable upload | Filename sanitization, Magic byte sniffing, UUID object paths, Server-enforced ACLs | V12.1, V12.2 |
+
+---
+
+## Cryptographic Envelope Encryption Architecture
+
+1. **Upload Flow**:
+   - User uploads plaintext file buffer via `/api/v1/files/upload`.
+   - Backend validates magic bytes (e.g. `FF D8 FF` for JPEG, `25 50 44 46` for PDF) and enforces quota limit.
+   - Pluggable Malware Scanner checks file buffer.
+   - Backend calls `libsodium.randombytes_buf(32)` to generate a unique Data Encryption Key (DEK).
+   - Backend calls `libsodium.randombytes_buf(24)` to generate an XChaCha20-Poly1305 file nonce.
+   - Backend encrypts plaintext using `libsodium.crypto_secretbox_easy(fileBuffer, fileNonce, dek)`.
+   - Backend encrypts DEK using Master Key Encryption Key (KEK) + `dekNonce`.
+   - Backend streams encrypted ciphertext to MinIO object named `objects/{uuid}.enc`.
+   - Backend stores `encrypted_dek`, `dek_nonce`, `file_nonce` in `file_keys` table.
+   - Plaintext file buffer and raw DEK are immediately wiped from memory.
+
+2. **Download Flow**:
+   - User requests `/api/v1/files/:id/download`.
+   - Backend verifies user ownership or valid share authorization.
+   - Backend fetches `file_keys` record and unwraps DEK using server KEK.
+   - Backend fetches encrypted object stream from MinIO.
+   - Backend decrypts stream on-the-fly using `crypto_secretbox_open_easy` and streams plaintext to browser response with proper headers (`Content-Disposition: attachment`).
+
+3. **Secure Shredding (Permanent Delete)**:
+   - When a user permanently deletes a file, backend executes `DELETE FROM file_keys WHERE file_id = :id`.
+   - Backend deletes `objects/{uuid}.enc` from MinIO.
+   - Without the DEK in `file_keys`, even if storage snapshots persist, the ciphertext is rendered mathematically irrecoverable (Cryptographic Erasure).
+
+---
+
+## Proposed Changes
+
+We will create a clean workspace directory structure with backend, frontend, database, docs, and docker components:
+
+```
+secure-file-vault/
+├── backend/
+│   ├── src/
+│   │   ├── config/          # Environment & App configuration
+│   │   ├── crypto/          # Argon2id, Libsodium envelope encryption, TOTP
+│   │   ├── database/        # PostgreSQL client & migrations
+│   │   ├── middleware/      # Auth check, CSRF validation, rate limiting
+│   │   ├── modules/
+│   │   │   ├── audit/       # Audit logger module
+│   │   │   ├── auth/        # Login, Register, Session management
+│   │   │   ├── files/       # File upload/download/delete logic
+│   │   │   ├── folders/     # Folder hierarchy management
+│   │   │   ├── mfa/         # TOTP setup & verification
+│   │   │   ├── shares/      # Link sharing & expiration
+│   │   │   └── users/       # Profile & security settings
+│   │   ├── plugins/         # Fastify plugins (CORS, Cookie, Helmet, RateLimit)
+│   │   ├── storage/         # MinIO client wrapper & quarantine pipeline
+│   │   ├── utils/           # Input validation schemas & helpers
+│   │   └── server.ts        # Main Fastify server startup
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── vitest.config.ts
+├── frontend/
+│   ├── src/
+│   │   ├── assets/          # Static assets & styles
+│   │   ├── components/      # UI components (Navbar, Modal, FileCard, Toast)
+│   │   ├── context/         # AuthContext, ThemeContext
+│   │   ├── pages/           # Dashboard, Files, Trash, Shares, Settings, Audit
+│   │   ├── services/        # API client with credentials & CSRF header
+│   │   ├── types/           # TypeScript API interfaces
+│   │   ├── App.tsx          # App routing
+│   │   ├── index.css        # Premium custom CSS tokens & design system
+│   │   └── main.tsx         # Entry point
+│   ├── index.html
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── vite.config.ts
+├── database/
+│   └── init.sql             # DB Initialization DDL script
+├── docs/
+│   ├── security-checklist.md # OWASP ASVS 5.0.0 compliance mapping
+│   └── architecture.md       # High-level architecture documentation
+├── docker-compose.yml       # Local Dev Stack (PostgreSQL 18, MinIO, Caddy)
+├── Caddyfile                # Reverse proxy security config
+├── .env.example             # Documented secret variables template
+└── README.md                # Comprehensive instructions
+```
+
+---
+
+## Phased Implementation Roadmap
+
+### Phase 1: Project Skeleton & Docker Infrastructure
+- Setup project directory structure (`backend`, `frontend`, `database`, `docs`).
+- Create `.env.example`, `docker-compose.yml` (PostgreSQL 18, MinIO, Caddy reverse proxy), `Caddyfile`, and `database/init.sql`.
+- Initialize Node.js 24 + TypeScript fastify backend with package dependencies.
+- Initialize Vite + React + TypeScript frontend.
+
+### Phase 2: Backend Core, Cryptography & Database Layer
+- Configure PostgreSQL database pool connection and migration loader.
+- Build Cryptography Engine (`src/crypto/`):
+  - Password hashing with Argon2id.
+  - Envelope Encryption with `libsodium-wrappers` (XChaCha20-Poly1305 DEK wrapping & file payload encryption).
+  - TOTP MFA secret generation, QR code generation, and recovery code hashing.
+- Build MinIO Object Storage Client & Upload Quarantine pipeline (`src/storage/`).
+
+### Phase 3: Auth, Session Management & MFA Modules
+- Implement user registration with email verification architecture.
+- Implement login with Argon2id password check, rate limiting, and TOTP MFA challenge.
+- Implement cryptographically secure session handling with HttpOnly cookie delivery and session revocation APIs (`/logout`, `/logout-all`, `/sessions`).
+- Implement TOTP MFA setup, verification, and recovery code authorization.
+- Write backend unit/integration tests for Auth and MFA in Vitest.
+
+### Phase 4: Folder Management, File Upload & Envelope Encryption Engine
+- Implement folder CRUD and path hierarchy logic.
+- Build File Upload Handler:
+  - Validate file size and MIME/magic bytes.
+  - Run quarantine scan.
+  - Encrypt payload with unique XChaCha20-Poly1305 DEK.
+  - Upload ciphertext to MinIO.
+  - Save metadata and wrapped DEK in PostgreSQL.
+- Build File Download & Decryption Streamer.
+- Implement File Operations: Rename, Move, Soft Delete (Trash), Restore, Permanent Delete (Cryptographic DEK Shredding).
+- Write backend tests for file encryption, upload/download, and ownership authorization.
+
+### Phase 5: File Sharing & Audit Logging Modules
+- Implement Share Link creation with optional password, download limits, and expiration timestamps.
+- Build Public Share Download route with password prompt & rate limiting.
+- Implement Security Audit Logging middleware to log events (`LOGIN_SUCCESS`, `FILE_UPLOADED`, `MFA_ENABLED`, etc.).
+
+### Phase 6: Frontend Development & UI Integration
+- Build modern design system in `index.css` with responsive dark mode, dynamic glassmorphic cards, smooth micro-animations, and Google Font (Inter / Outfit).
+- Build Auth Pages (`/login`, `/register`, `/forgot-password`, `/reset-password`).
+- Build Main Dashboard (`/dashboard`) with storage usage meter, quick actions, recent files, and security summary.
+- Build File Browser (`/files`, `/files/:id`) with folder tree navigation, search, drag-and-drop upload, details sidebar, rename, move, delete.
+- Build Trash Page (`/trash`) & Shares Page (`/shared`).
+- Build Security Settings (`/settings/security`, `/settings/mfa`, `/settings/sessions`) with TOTP QR setup modal and session management table.
+- Build Audit Log Viewer (`/audit`).
+
+### Phase 7: Verification & Security Documentation
+- Run backend & frontend tests (Vitest / Playwright).
+- Create `docs/security-checklist.md` mapping controls against OWASP ASVS 5.0.0.
+- Verify security headers, rate limiting, CSRF protection, and SQL injection prevention.
+- Create walkthrough artifact detailing completed work and verification commands.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- Execute Vitest suite covering cryptography, authorization checks, session rotation, and upload/download encryption pipelines.
+```powershell
+npm --prefix backend test
+```
+- Execute E2E Playwright tests for auth and file vault workflows.
+```powershell
+npm --prefix frontend test:e2e
+```
+
+### Manual Verification
+- Test user registration, login, TOTP MFA flow via Google Authenticator / Authy app.
+- Upload files (images, PDFs, text files) and verify that MinIO object storage stores ONLY `.enc` ciphertext files that are unreadable in raw format.
+- Test downloading files and verify original integrity (hash matching).
+- Test share link creation with password and expiration limits.
+- Verify session revocation from another session.
+- Check security headers with Caddy/Nginx reverse proxy or Fastify Helmet.
